@@ -98,6 +98,7 @@ return Application::configure(basePath: dirname(__DIR__))
         $schedule->command('checkout:fire-abandoned-cart-webhooks')->everyTenMinutes();
         $schedule->command('checkout:send-cart-recovery-emails')->everyMinute();
         $schedule->command('email-campaign:process')->everyMinute();
+        $schedule->command('subscriptions:asaas-pix-auto-renewals --limit=200')->dailyAt('08:30');
         $schedule->command('payments:reconcile-pending --limit=200 --days=45')->everyTwoMinutes();
         $schedule->command('schedule:heartbeat')->everyMinute();
         $schedule->job(new \App\Jobs\QueueHeartbeatJob)->everyMinute();

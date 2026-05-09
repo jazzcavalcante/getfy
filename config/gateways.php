@@ -125,7 +125,7 @@ return [
             'slug' => 'asaas',
             'name' => 'Asaas',
             'image' => 'images/gateways/asaas.png',
-            'methods' => ['pix', 'card', 'boleto'],
+            'methods' => ['pix', 'card', 'boleto', 'pix_auto'],
             'scope' => 'national',
             'country' => 'br',
             'country_name' => 'Brasil',
@@ -166,7 +166,7 @@ return [
         'pix' => ['cajupay', 'spacepag', 'efi', 'mercadopago', 'pagarme', 'pushinpay', 'asaas'],
         'card' => ['efi', 'stripe', 'mercadopago', 'pagarme', 'asaas'],
         'boleto' => ['efi', 'mercadopago', 'pagarme', 'asaas'],
-        'pix_auto' => ['efi', 'pushinpay'],
+        'pix_auto' => ['efi', 'pushinpay', 'asaas'],
         'crypto' => [],
     ],
 ];

@@ -22,6 +22,7 @@ use App\Models\Subscription;
 use App\Models\SubscriptionPlan;
 use App\Models\User;
 use App\Services\GeoIp;
+use App\Services\AsaasPixAutomaticService;
 use App\Services\EfiPixRecorrenteService;
 use App\Services\StorageService;
 use App\Services\PaymentService;
@@ -1086,6 +1087,122 @@ class CheckoutController extends Controller
                         ], 422);
                     }
                     return back()->with('error', $e->getMessage() ?: 'Não foi possível gerar o PIX automático. Tente novamente.');
+                }
+            }
+
+            if ($gatewaySlug === 'asaas') {
+                $credential = GatewayCredential::forTenant($tenantId)
+                    ->where('gateway_slug', 'asaas')
+                    ->where('is_connected', true)
+                    ->first();
+                if (! $credential) {
+                    if ($request->expectsJson()) {
+                        return response()->json(['message' => 'Asaas nao configurado para PIX automatico.'], 422);
+                    }
+                    return back()->withErrors(['payment_method' => 'Asaas nao configurado para PIX automatico.']);
+                }
+                $credentials = $credential->getDecryptedCredentials();
+                if (empty($credentials['api_key'])) {
+                    if ($request->expectsJson()) {
+                        return response()->json(['message' => 'Asaas: API Key nao configurada.'], 422);
+                    }
+                    return back()->withErrors(['payment_method' => 'Asaas: API Key nao configurada.']);
+                }
+
+                $order = $createOrderAndItems(array_merge($orderPayload, [
+                    'status' => 'pending',
+                    'gateway' => null,
+                    'gateway_id' => null,
+                    'metadata' => array_merge($orderMetadata, ['checkout_payment_method' => 'pix_auto']),
+                ]));
+                $order->load('orderItems');
+                event(new OrderPending($order));
+
+                $rawDoc = preg_replace('/\D/', '', $validated['cpf'] ?? '');
+                $fake = FakeConsumerData::getForGateway($order->id);
+                $consumer = [
+                    'name' => trim((string) ($validated['name'] ?? '')) !== '' ? $validated['name'] : $fake['name'],
+                    'document' => strlen($rawDoc) >= 11 ? $rawDoc : $fake['document'],
+                    'email' => $validated['email'],
+                    'phone' => $validated['phone'] ?? '',
+                ];
+
+                try {
+                    $service = new AsaasPixAutomaticService($credentials);
+                    $startDate = $periodEnd
+                        ? $periodEnd->format('Y-m-d')
+                        : now()->copy()->addMonth()->format('Y-m-d');
+                    if ($startDate === now()->format('Y-m-d')) {
+                        $startDate = now()->copy()->addDay()->format('Y-m-d');
+                    }
+                    $finishDate = $periodEnd
+                        ? $periodEnd->copy()->addYears(10)->format('Y-m-d')
+                        : now()->addYears(10)->format('Y-m-d');
+                    $frequency = AsaasPixAutomaticService::intervalToFrequency($plan->interval ?? SubscriptionPlan::INTERVAL_MONTHLY);
+                    $description = mb_substr(preg_replace('/[^\p{L}\p{N}\s\.\-]/u', '', $product->name ?? 'Assinatura'), 0, 35) ?: 'Assinatura';
+                    $authorization = $service->createAuthorization(
+                        (float) $totalAmount,
+                        $consumer,
+                        'order_' . $order->id,
+                        $frequency,
+                        $startDate,
+                        $finishDate,
+                        $description
+                    );
+
+                    $order->update([
+                        'gateway' => 'asaas',
+                        'gateway_id' => $authorization['authorization_id'],
+                        'metadata' => array_merge($order->metadata ?? [], [
+                            'asaas_pix_auto_authorization_id' => $authorization['authorization_id'],
+                            'asaas_pix_auto_conciliation_identifier' => $authorization['conciliation_identifier'],
+                        ]),
+                    ]);
+
+                    event(new PixGenerated($order, [
+                        'qrcode' => null,
+                        'copy_paste' => $authorization['copy_paste'] ?? '',
+                        'transaction_id' => $authorization['authorization_id'],
+                    ]));
+                    $updateCheckoutSession($order);
+
+                    if ($request->expectsJson()) {
+                        return $this->idempotencyReturn($idempotencyKey, response()->json([
+                            'success' => true,
+                            'payment_method' => 'pix_auto',
+                            'order_id' => $order->id,
+                            'qrcode' => null,
+                            'copy_paste' => $authorization['copy_paste'] ?? '',
+                            'transaction_id' => $authorization['authorization_id'],
+                        ]));
+                    }
+                    $redirectUrl = $product->checkout_config['redirect_after_purchase'] ?? null;
+                    $redirectUrl = ! empty($redirectUrl) && is_string($redirectUrl) ? $redirectUrl : null;
+                    $pixToken = Str::random(32);
+                    session()->put('pix_display.' . $pixToken, [
+                        'order_id' => $order->id,
+                        'qrcode' => null,
+                        'copy_paste' => $authorization['copy_paste'] ?? '',
+                        'amount' => $totalAmount,
+                        'product_name' => $product->name,
+                        'checkout_slug' => $checkoutSlug,
+                        'redirect_after_purchase' => $redirectUrl,
+                        'customer_name' => $validated['name'] ?? null,
+                        'customer_email' => $validated['email'] ?? null,
+                        'customer_phone' => $validated['phone'] ?? null,
+                        'created_at' => time(),
+                    ]);
+
+                    return $this->idempotencyReturn($idempotencyKey, redirect()->route('checkout.pix', ['token' => $pixToken]));
+                } catch (\Throwable $e) {
+                    $this->rollbackFailedOrder($order, $e);
+                    if ($request->expectsJson()) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => $e->getMessage() ?: 'Nao foi possivel gerar o PIX automatico. Tente novamente.',
+                        ], 422);
+                    }
+                    return back()->with('error', $e->getMessage() ?: 'Nao foi possivel gerar o PIX automatico. Tente novamente.');
                 }
             }
 

@@ -16,6 +16,7 @@ use App\Models\GatewayCredential;
 use App\Models\Setting;
 use App\Models\SubscriptionPlan;
 use App\Models\User;
+use App\Services\AsaasPixAutomaticService;
 use App\Services\EfiPixRecorrenteService;
 use App\Services\PaymentService;
 use App\Services\PushinPayPixRecorrenteService;
@@ -555,6 +556,69 @@ class ApiCheckoutController extends Controller
                         'order_id' => $order->id,
                         'qrcode' => $qrcodeImage,
                         'copy_paste' => $copyPaste ?? '',
+                        'amount' => $amount,
+                        'product_name' => $product?->name ?? 'Pagamento',
+                        'redirect_after_purchase' => route('api-checkout.thank-you', ['order_id' => $order->id]),
+                        'created_at' => time(),
+                    ]);
+                    return redirect()->route('checkout.pix', ['token' => $pixToken]);
+                }
+
+                if ($gatewaySlug === 'asaas') {
+                    $credential = GatewayCredential::forTenant($tenantId)
+                        ->where('gateway_slug', 'asaas')
+                        ->where('is_connected', true)
+                        ->first();
+                    if (! $credential) {
+                        throw new \RuntimeException('Asaas nao configurado para PIX automatico.');
+                    }
+                    $credentials = $credential->getDecryptedCredentials();
+                    if (empty($credentials['api_key'])) {
+                        throw new \RuntimeException('Asaas: API Key nao configurada.');
+                    }
+
+                    $service = new AsaasPixAutomaticService($credentials);
+                    $startDate = $periodEnd
+                        ? $periodEnd->format('Y-m-d')
+                        : now()->copy()->addMonth()->format('Y-m-d');
+                    if ($startDate === now()->format('Y-m-d')) {
+                        $startDate = now()->copy()->addDay()->format('Y-m-d');
+                    }
+                    $finishDate = $periodEnd
+                        ? $periodEnd->copy()->addYears(10)->format('Y-m-d')
+                        : now()->addYears(10)->format('Y-m-d');
+                    $frequency = AsaasPixAutomaticService::intervalToFrequency($plan?->interval ?? SubscriptionPlan::INTERVAL_MONTHLY);
+                    $description = mb_substr(preg_replace('/[^\p{L}\p{N}\s\.\-]/u', '', $product?->name ?? 'Assinatura'), 0, 35) ?: 'Assinatura';
+                    $authorization = $service->createAuthorization(
+                        (float) $amount,
+                        $consumer,
+                        'order_' . $order->id,
+                        $frequency,
+                        $startDate,
+                        $finishDate,
+                        $description
+                    );
+
+                    $order->update([
+                        'gateway' => 'asaas',
+                        'gateway_id' => $authorization['authorization_id'],
+                        'metadata' => array_merge($order->metadata ?? [], [
+                            'asaas_pix_auto_authorization_id' => $authorization['authorization_id'],
+                            'asaas_pix_auto_conciliation_identifier' => $authorization['conciliation_identifier'],
+                        ]),
+                    ]);
+
+                    event(new PixGenerated($order, [
+                        'qrcode' => null,
+                        'copy_paste' => $authorization['copy_paste'] ?? '',
+                        'transaction_id' => $authorization['authorization_id'],
+                    ]));
+
+                    $pixToken = Str::random(32);
+                    session()->put('pix_display.' . $pixToken, [
+                        'order_id' => $order->id,
+                        'qrcode' => null,
+                        'copy_paste' => $authorization['copy_paste'] ?? '',
                         'amount' => $amount,
                         'product_name' => $product?->name ?? 'Pagamento',
                         'redirect_after_purchase' => route('api-checkout.thank-you', ['order_id' => $order->id]),

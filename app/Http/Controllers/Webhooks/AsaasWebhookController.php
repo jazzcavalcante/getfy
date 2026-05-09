@@ -19,6 +19,11 @@ class AsaasWebhookController extends Controller
      */
     public function handle(Request $request): JsonResponse
     {
+        $eventType = strtoupper((string) $request->input('event', ''));
+        if (str_starts_with($eventType, 'PIX_AUTOMATIC_RECURRING_')) {
+            return $this->handlePixAutomatic($request, $eventType);
+        }
+
         $payment = $request->input('payment');
         if (! is_array($payment)) {
             return response()->json(['received' => true]);
@@ -29,7 +34,7 @@ class AsaasWebhookController extends Controller
         }
         $transactionId = (string) $transactionId;
 
-        $order = Order::where('gateway', 'asaas')->where('gateway_id', $transactionId)->first();
+        $order = $this->findOrderForPayment($payment, $transactionId);
         if (! $order) {
             Log::debug('AsaasWebhook: order not found', ['gateway_id' => $transactionId]);
             return response()->json(['received' => true]);
@@ -39,7 +44,6 @@ class AsaasWebhookController extends Controller
             return response()->json(['message' => 'Unauthorized'], 401);
         }
 
-        $eventType = strtoupper((string) $request->input('event', ''));
         $event = 'order.pending';
         $mappedStatus = 'pending';
 
@@ -57,6 +61,96 @@ class AsaasWebhookController extends Controller
         ProcessPaymentWebhook::dispatchSync('asaas', $transactionId, $event, $mappedStatus, $request->all());
 
         return response()->json(['received' => true]);
+    }
+
+    private function handlePixAutomatic(Request $request, string $eventType): JsonResponse
+    {
+        $authorization = $request->input('authorization');
+        $instruction = $request->input('paymentInstruction');
+        $paymentId = is_array($instruction) && isset($instruction['payment']) ? (string) $instruction['payment'] : null;
+
+        if ($paymentId !== null && $paymentId !== '') {
+            $order = Order::where('gateway', 'asaas')->where('gateway_id', $paymentId)->first();
+            if ($order && ! $this->verifyWebhookSignature('asaas', $order->tenant_id, $request)) {
+                return response()->json(['message' => 'Unauthorized'], 401);
+            }
+            return response()->json(['received' => true]);
+        }
+
+        $authorizationId = null;
+        if (is_array($authorization) && isset($authorization['id'])) {
+            $authorizationId = (string) $authorization['id'];
+        } elseif (is_array($instruction) && isset($instruction['authorization']['id'])) {
+            $authorizationId = (string) $instruction['authorization']['id'];
+        }
+
+        if ($authorizationId === null || $authorizationId === '') {
+            return response()->json(['received' => true]);
+        }
+
+        $order = Order::where('gateway', 'asaas')
+            ->where(function ($query) use ($authorizationId) {
+                $query->where('gateway_id', $authorizationId)
+                    ->orWhere('metadata->asaas_pix_auto_authorization_id', $authorizationId);
+            })
+            ->latest('id')
+            ->first();
+        if (! $order) {
+            Log::debug('AsaasWebhook Pix Automatico: order not found', ['authorization_id' => $authorizationId, 'event' => $eventType]);
+            return response()->json(['received' => true]);
+        }
+
+        if (! $this->verifyWebhookSignature('asaas', $order->tenant_id, $request)) {
+            return response()->json(['message' => 'Unauthorized'], 401);
+        }
+
+        if (in_array($eventType, [
+            'PIX_AUTOMATIC_RECURRING_AUTHORIZATION_CANCELLED',
+            'PIX_AUTOMATIC_RECURRING_AUTHORIZATION_EXPIRED',
+            'PIX_AUTOMATIC_RECURRING_AUTHORIZATION_REFUSED',
+        ], true)) {
+            Log::info('AsaasWebhook Pix Automatico authorization inactive', [
+                'order_id' => $order->id,
+                'authorization_id' => $authorizationId,
+                'event' => $eventType,
+            ]);
+        }
+
+        return response()->json(['received' => true]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $payment
+     */
+    private function findOrderForPayment(array $payment, string $transactionId): ?Order
+    {
+        $order = Order::where('gateway', 'asaas')->where('gateway_id', $transactionId)->first();
+        if ($order) {
+            return $order;
+        }
+
+        $externalReference = $payment['externalReference'] ?? null;
+        if (is_string($externalReference) && preg_match('/^(?:order|renewal)_(\d+)$/', $externalReference, $matches)) {
+            $order = Order::where('gateway', 'asaas')->whereKey((int) $matches[1])->first();
+            if ($order) {
+                $order->update(['gateway_id' => $transactionId]);
+                return $order;
+            }
+        }
+
+        $conciliationIdentifier = $payment['conciliationIdentifier'] ?? $payment['pixTransaction']['conciliationIdentifier'] ?? null;
+        if (is_string($conciliationIdentifier) && $conciliationIdentifier !== '') {
+            $order = Order::where('gateway', 'asaas')
+                ->where('metadata->asaas_pix_auto_conciliation_identifier', $conciliationIdentifier)
+                ->latest('id')
+                ->first();
+            if ($order) {
+                $order->update(['gateway_id' => $transactionId]);
+                return $order;
+            }
+        }
+
+        return null;
     }
 
     /**

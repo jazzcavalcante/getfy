@@ -12,6 +12,7 @@ use App\Models\GatewayCredential;
 use App\Models\Order;
 use App\Models\Setting;
 use App\Models\Subscription;
+use App\Services\AsaasPixAutomaticService;
 use App\Services\EfiPixRecorrenteService;
 use App\Services\PaymentService;
 use App\Support\FakeConsumerData;
@@ -128,6 +129,65 @@ class RenewalController extends Controller
         ];
 
         if ($paymentMethod === 'pix_auto' && $subscription->gateway_subscription_id) {
+            $asaasSourceOrder = Order::where('tenant_id', $tenantId)
+                ->where('user_id', $user->id)
+                ->where('product_id', $product->id)
+                ->where('subscription_plan_id', $plan->id)
+                ->where('gateway', 'asaas')
+                ->where('metadata->asaas_pix_auto_authorization_id', $subscription->gateway_subscription_id)
+                ->latest('id')
+                ->first();
+            if ($asaasSourceOrder) {
+                $credential = GatewayCredential::forTenant($tenantId)
+                    ->where('gateway_slug', 'asaas')
+                    ->where('is_connected', true)
+                    ->first();
+                if ($credential) {
+                    $credentials = $credential->getDecryptedCredentials();
+                    if (! empty($credentials['api_key'])) {
+                        $dataDeVencimento = $periodEnd ? $periodEnd->format('Y-m-d') : now()->addMonth()->format('Y-m-d');
+                        $service = new AsaasPixAutomaticService($credentials);
+                        if (! $service->isWithinInstructionWindow($dataDeVencimento)) {
+                            return redirect()->route('renewal.show', $request->input('token'))
+                                ->with('info', 'A cobrança PIX automático será agendada automaticamente dentro da janela aceita pelo Asaas.');
+                        }
+
+                        $order = Order::create(array_merge($orderPayload, [
+                            'status' => 'pending',
+                            'gateway' => 'asaas',
+                            'gateway_id' => null,
+                            'cpf' => $asaasSourceOrder->cpf,
+                            'phone' => $asaasSourceOrder->phone,
+                            'metadata' => ['checkout_payment_method' => 'pix_auto'],
+                        ]));
+                        event(new OrderPending($order));
+                        try {
+                            $consumer = [
+                                'name' => $user->name ?? $user->email,
+                                'document' => $asaasSourceOrder->cpf ?: '00000000000',
+                                'email' => $user->email,
+                                'phone' => $asaasSourceOrder->phone ?? '',
+                            ];
+                            $payment = $service->createAutomaticPayment(
+                                $subscription->gateway_subscription_id,
+                                $amount,
+                                $consumer,
+                                'renewal_' . $order->id,
+                                $dataDeVencimento,
+                                'Renovacao assinatura #' . $subscription->id
+                            );
+                            $order->update(['gateway_id' => $payment['payment_id']]);
+
+                            return redirect()->route('renewal.show', $request->input('token'))
+                                ->with('info', 'O débito PIX automático foi agendado. Você receberá a confirmação quando o pagamento for processado.');
+                        } catch (\Throwable $e) {
+                            $order->delete();
+                            return back()->with('error', $e->getMessage() ?: 'Não foi possível agendar o PIX automático. Tente outro método.');
+                        }
+                    }
+                }
+            }
+
             $credential = GatewayCredential::forTenant($tenantId)
                 ->where('gateway_slug', 'efi')
                 ->where('is_connected', true)

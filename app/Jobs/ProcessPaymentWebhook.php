@@ -12,6 +12,7 @@ use App\Gateways\GatewayRegistry;
 use App\Models\GatewayCredential;
 use App\Models\Order;
 use App\Models\Subscription;
+use App\Services\AsaasPixAutomaticService;
 use App\Services\EfiPixRecorrenteService;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -117,6 +118,8 @@ class ProcessPaymentWebhook implements ShouldQueue
                         $metadata = $order->metadata ?? [];
                         if (isset($metadata['efi_pix_auto_id_rec']) && $this->gatewaySlug === 'efi') {
                             $idRec = $metadata['efi_pix_auto_id_rec'];
+                        } elseif (isset($metadata['asaas_pix_auto_authorization_id']) && $this->gatewaySlug === 'asaas') {
+                            $idRec = $metadata['asaas_pix_auto_authorization_id'];
                         } elseif (isset($metadata['pushinpay_subscription_id']) && $this->gatewaySlug === 'pushinpay') {
                             $idRec = $metadata['pushinpay_subscription_id'];
                         }
@@ -134,6 +137,8 @@ class ProcessPaymentWebhook implements ShouldQueue
 
                         if ($idRec !== null && $this->gatewaySlug === 'efi') {
                             $this->createEfiPixAutoCobrForNextPeriod($order, $subscription, $plan);
+                        } elseif ($idRec !== null && $this->gatewaySlug === 'asaas') {
+                            $this->createAsaasPixAutoPaymentForNextPeriod($order, $subscription, $plan);
                         }
                     }
                 }
@@ -292,5 +297,94 @@ class ProcessPaymentWebhook implements ShouldQueue
                 'message' => $e->getMessage(),
             ]);
         }
+    }
+
+    private function createAsaasPixAutoPaymentForNextPeriod(Order $order, Subscription $subscription, $plan): void
+    {
+        $credential = GatewayCredential::forTenant($order->tenant_id)
+            ->where('gateway_slug', 'asaas')
+            ->where('is_connected', true)
+            ->first();
+        if (! $credential) {
+            return;
+        }
+        $credentials = $credential->getDecryptedCredentials();
+        if (empty($credentials['api_key'])) {
+            return;
+        }
+
+        $authorizationId = $subscription->gateway_subscription_id;
+        if ($authorizationId === null || $authorizationId === '') {
+            return;
+        }
+
+        $periodEnd = $subscription->current_period_end;
+        $dueDate = $periodEnd ? $periodEnd->format('Y-m-d') : now()->addMonth()->format('Y-m-d');
+        $service = new AsaasPixAutomaticService($credentials);
+        if (! $service->isWithinInstructionWindow($dueDate)) {
+            Log::info('ProcessPaymentWebhook: Asaas Pix Automatico aguardando janela de cobranca', [
+                'subscription_id' => $subscription->id,
+                'due_date' => $dueDate,
+            ]);
+            return;
+        }
+
+        try {
+            $renewalOrder = Order::create([
+                'tenant_id' => $order->tenant_id,
+                'user_id' => $order->user_id,
+                'product_id' => $order->product_id,
+                'product_offer_id' => null,
+                'subscription_plan_id' => $order->subscription_plan_id,
+                'status' => 'pending',
+                'gateway' => 'asaas',
+                'gateway_id' => null,
+                'is_renewal' => true,
+                'amount' => (float) $plan->price,
+                'email' => $order->email,
+                'cpf' => $order->cpf,
+                'phone' => $order->phone,
+                'period_start' => $subscription->current_period_end,
+                'period_end' => $this->nextPeriodEnd($subscription, $plan),
+                'metadata' => ['checkout_payment_method' => 'pix_auto'],
+            ]);
+            $consumer = [
+                'name' => $order->user ? ($order->user->name ?: $order->email) : $order->email,
+                'document' => $order->cpf ?: '00000000000',
+                'email' => $order->email,
+                'phone' => $order->phone ?? '',
+            ];
+            $payment = $service->createAutomaticPayment(
+                $authorizationId,
+                (float) $plan->price,
+                $consumer,
+                'renewal_' . $renewalOrder->id,
+                $dueDate,
+                'Renovacao assinatura #' . $subscription->id
+            );
+            $renewalOrder->update(['gateway_id' => $payment['payment_id']]);
+        } catch (\Throwable $e) {
+            Log::warning('ProcessPaymentWebhook: falha ao criar cobranca Asaas Pix Automatico', [
+                'order_id' => $order->id,
+                'subscription_id' => $subscription->id,
+                'message' => $e->getMessage(),
+            ]);
+        }
+    }
+
+    private function nextPeriodEnd(Subscription $subscription, $plan): ?\Illuminate\Support\Carbon
+    {
+        $start = $subscription->current_period_end;
+        if (! $start) {
+            return null;
+        }
+
+        return match ($plan->interval ?? null) {
+            'weekly' => $start->copy()->addWeek(),
+            'quarterly' => $start->copy()->addMonths(3),
+            'semi_annual' => $start->copy()->addMonths(6),
+            'annual' => $start->copy()->addYear(),
+            default => $start->copy()->addMonth(),
+        };
     }
 }

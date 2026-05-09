@@ -373,6 +373,9 @@ class AsaasDriver implements GatewayDriver
         $baseUrl = $this->getBaseUrl($credentials);
         try {
             $response = $this->http($credentials)->get($baseUrl . '/lean/payments/' . $transactionId);
+            if ($response->status() === 404) {
+                $response = $this->http($credentials)->get($baseUrl . '/payments/' . $transactionId);
+            }
             if (! $response->successful()) {
                 if ($response->status() === 404) {
                     return null;
